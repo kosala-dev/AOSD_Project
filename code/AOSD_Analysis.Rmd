@@ -1,0 +1,548 @@
+---
+title: "Gene Activity in Immune Cells for Detecting Adult-onset Still’s Disease"
+author: "Registration number: 2021ICT36"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 5, dpi = 120)
+
+# The brief puts data/ and figures/ at the repo root, one level above code/
+root    <- if (dir.exists("../data")) ".." else "."
+fig_dir <- file.path(root, "figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# save ggplot 
+save_fig <- function(p, name, w = 7, h = 5) {
+  ggplot2::ggsave(file.path(fig_dir, paste0(name, ".png")), p,
+                  width = w, height = h, dpi = 300)
+  ggplot2::ggsave(file.path(fig_dir, paste0(name, ".pdf")), p,
+                  width = w, height = h)
+  print(p)
+  invisible(p)
+}
+
+# Save pheatmap 
+save_pheat <- function(ph, name, w = 7, h = 6) {
+  png(file.path(fig_dir, paste0(name, ".png")), width = w, height = h,
+      units = "in", res = 300)
+  grid::grid.draw(ph$gtable)
+  invisible(dev.off())
+
+  pdf(file.path(fig_dir, paste0(name, ".pdf")), width = w, height = h)
+  grid::grid.draw(ph$gtable)
+  invisible(dev.off())
+  invisible(ph)
+}
+```
+
+# 1. Data
+
+```{r packages}
+cran_pkgs <- c("tidyverse", "pheatmap", "caret", "e1071", "ggrepel", "BiocManager")
+bioc_pkgs <- c("GEOquery", "limma", "clusterProfiler", "org.Hs.eg.db", "enrichplot")
+
+for (p in cran_pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+for (p in bioc_pkgs) if (!requireNamespace(p, quietly = TRUE)) {
+  BiocManager::install(p, ask = FALSE, update = FALSE)
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GEOquery)
+  library(limma)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(pheatmap)
+  library(caret)
+  library(e1071)
+  library(ggrepel)
+})
+
+set.seed(2026)
+```
+
+## 1.1 Source
+
+The dataset is **GSE113645** taken from the NCBI Gene Expression Omnibus (GEO). It contains monocyte gene expression from patients with active AOSD, patients with inactive AOSD, and healthy controls. The study measured these profiles to investigate the role of PLAC8 in AOSD.
+
+The series matrix file is read from `data/` at the repo root, and the parsed object is cached as an `.rds` file so later knits are fast.
+
+```{r download}
+gse_id      <- "GSE113645"
+data_dir    <- file.path(root, "data")
+dir.create(data_dir, showWarnings = FALSE)
+cache_file  <- file.path(data_dir, paste0(gse_id, ".rds"))
+matrix_file <- file.path(data_dir, paste0(gse_id, "_series_matrix.txt.gz"))
+
+# Show where R is looking, so a misplaced file is easy to spot
+cat("Working directory:", normalizePath(getwd()), "\n")
+
+# Search for a manually downloaded series matrix
+find_local_matrix <- function() {
+  search_dirs <- unique(c(data_dir, ".", path.expand("~/Downloads")))
+  hits <- unlist(lapply(search_dirs, function(d) {
+    if (!dir.exists(d)) return(NULL)
+    list.files(d, pattern = paste0(gse_id, ".*series_matrix"),
+               ignore.case = TRUE, full.names = TRUE)
+  }))
+  unique(hits)
+}
+
+if (file.exists(cache_file)) {
+  gse_list <- readRDS(cache_file)
+} else {
+  if (!file.exists(matrix_file)) {
+    hits <- find_local_matrix()
+    if (length(hits) == 0) {
+      stop("Series matrix file not found. R expected it at: ",
+           normalizePath(matrix_file, mustWork = FALSE),
+           "\nPlace GSE113645_series_matrix.txt.gz in the data/ folder ",
+           "at the repository root, then knit again.", call. = FALSE)
+    }
+    cat("Found:", hits[1], "\nCopying it to:", matrix_file, "\n")
+    file.copy(hits[1], matrix_file, overwrite = TRUE)
+  }
+
+  # Confirm the file is a GEO series matrix, not an HTML error page
+  first_line <- readLines(gzfile(matrix_file), n = 1, warn = FALSE)
+  if (!grepl("^!Series", first_line[1])) {
+    stop("This file does not look like a GEO series matrix. First line: ",
+         first_line[1], call. = FALSE)
+  }
+
+  gse_list <- getGEO(filename = matrix_file, GSEMatrix = TRUE)
+
+  # A local file returns a single ExpressionSet, so wrap it in a list
+  if (!is.list(gse_list)) gse_list <- list(gse_list)
+  saveRDS(gse_list, cache_file)
+}
+
+# Keep the platform with the most samples if the series has more than one
+eset <- gse_list[[which.max(sapply(gse_list, ncol))]]
+cat("Platform:", annotation(eset), "| Probes:", nrow(eset), "| Samples:", ncol(eset), "\n")
+```
+
+## 1.2 Variables and sample groups
+
+```{r inspect-metadata}
+pheno     <- pData(eset)
+char_cols <- grep("characteristics", colnames(pheno), value = TRUE)
+
+for (cc in char_cols) {
+  cat("\n", cc, "\n")
+  print(table(pheno[[cc]], useNA = "ifany"))
+}
+```
+
+```{r define-groups}
+group_col <- char_cols[1]
+group_raw <- pheno[[group_col]]
+
+# Inactive is checked before Active because "inactive" contains the word "active"
+group <- case_when(
+  grepl("healthy|control|normal", group_raw, ignore.case = TRUE) ~ "Healthy",
+  grepl("inactive", group_raw, ignore.case = TRUE)              ~ "Inactive",
+  grepl("active", group_raw, ignore.case = TRUE)                ~ "Active",
+  TRUE ~ NA_character_
+)
+
+if (anyNA(group)) {
+  stop("Unmapped labels: ", paste(unique(group_raw[is.na(group)]), collapse = "; "))
+}
+
+group <- factor(group, levels = c("Healthy", "Inactive", "Active"))
+table(group)
+```
+
+# 2. Data cleaning and preprocessing
+
+```{r preprocessing}
+expr <- exprs(eset)
+cat("Missing values:", sum(is.na(expr)), "\n")
+cat("Value range:", round(range(expr, na.rm = TRUE), 2), "\n")
+
+# Log2-transform if values are still on the raw intensity scale
+if (max(expr, na.rm = TRUE) > 100) expr <- log2(expr + 1)
+
+# Remove probes with missing values
+expr <- expr[complete.cases(expr), ]
+cat("Probes after removing missing values:", nrow(expr), "\n")
+```
+
+## 2.1 Mapping probes to genes
+
+Microarrays measure probes, and several probes can target the same gene. Probes are mapped to gene symbols, and when a gene has more than one probe, the probe with the highest mean expression is kept.
+
+```{r annotate}
+fd       <- fData(eset)
+sym_col  <- grep("symbol", colnames(fd), ignore.case = TRUE, value = TRUE)[1]
+if (is.na(sym_col)) stop("No gene symbol column found; annotate probes with the platform file.")
+cat("Using annotation column:", sym_col, "\n")
+
+ann <- tibble(
+  probe  = rownames(expr),
+  symbol = sub(" ///.*", "", fd[rownames(expr), sym_col])
+) %>%
+  filter(!is.na(symbol), symbol != "")
+
+ann$mean_expr <- rowMeans(expr[ann$probe, ])
+
+collapsed <- ann %>%
+  group_by(symbol) %>%
+  slice_max(mean_expr, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+expr_gene <- expr[collapsed$probe, ]
+rownames(expr_gene) <- collapsed$symbol
+cat("Probes:", nrow(expr), "-> unique genes:", nrow(expr_gene), "\n")
+```
+
+## 2.2 Filtering low-expression genes
+
+Genes in the lowest quartile of mean expression are mostly noise and inflate the multiple-testing burden, so they are removed.
+
+```{r filter}
+gene_means <- rowMeans(expr_gene)
+expr_gene  <- expr_gene[gene_means > quantile(gene_means, 0.25), ]
+cat("Genes retained:", nrow(expr_gene), "\n")
+
+sample_info <- tibble(sample = colnames(expr_gene), group = group)
+```
+
+# 3. Exploratory data analysis
+
+## 3.1 Distribution of expression per sample
+
+Comparable distributions across samples indicate that technical normalisation worked. Large shifts would suggest batch effects.
+
+```{r eda-density}
+set.seed(1)
+idx <- sample(nrow(expr_gene), min(3000, nrow(expr_gene)))
+
+p_density <- as_tibble(expr_gene[idx, ], rownames = "gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  left_join(sample_info, by = "sample") %>%
+  ggplot(aes(expression, colour = group, group = sample)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Expression distribution per sample",
+       x = "log2 expression", y = "Density", colour = "Group") +
+  theme_minimal()
+
+save_fig(p_density, "01_expression_density")
+```
+
+## 3.2 Principal component analysis
+
+PCA shows whether the largest sources of variation follow disease group. If they do not, technical factors may dominate.
+
+```{r eda-pca}
+gene_var  <- apply(expr_gene, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:1000]
+
+pca     <- prcomp(t(expr_gene[top_genes, ]), scale. = TRUE)
+var_pct <- round(100 * summary(pca)$importance[2, 1:2], 1)
+
+p_pca <- as_tibble(pca$x[, 1:2], rownames = "sample") %>%
+  left_join(sample_info, by = "sample") %>%
+  ggplot(aes(PC1, PC2, colour = group)) +
+  geom_point(size = 3) +
+  stat_ellipse(linetype = "dashed", show.legend = FALSE) +
+  labs(title = "PCA of the 1000 most variable genes",
+       x = paste0("PC1 (", var_pct[1], "%)"),
+       y = paste0("PC2 (", var_pct[2], "%)"),
+       colour = "Group") +
+  theme_minimal()
+
+save_fig(p_pca, "02_pca_top1000_genes")
+```
+
+## 3.3 Sample correlation
+
+```{r eda-heatmap}
+annot_col <- data.frame(Group = group, row.names = colnames(expr_gene))
+
+ph_cor <- pheatmap(cor(expr_gene[top_genes, ]),
+                   annotation_col = annot_col,
+                   annotation_row = annot_col,
+                   show_rownames  = FALSE,
+                   show_colnames  = FALSE,
+                   main = "Sample correlation (1000 most variable genes)")
+
+save_pheat(ph_cor, "03_sample_correlation")
+```
+
+# 4. Main analysis
+
+## 4.1 Differential expression with limma
+
+`limma` fits a linear model to each gene and uses empirical Bayes moderation of the variance, which is well suited to small sample sizes. Results are corrected for multiple testing with the Benjamini–Hochberg method.
+
+```{r limma-fit}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(expr_gene, design)
+
+contr <- makeContrasts(
+  Active_vs_Healthy   = Active - Healthy,
+  Inactive_vs_Healthy = Inactive - Healthy,
+  Active_vs_Inactive  = Active - Inactive,
+  levels = design
+)
+
+fit2 <- eBayes(contrasts.fit(fit, contr))
+```
+
+```{r de-results}
+get_de <- function(coef) {
+  topTable(fit2, coef = coef, number = Inf) %>% rownames_to_column("gene")
+}
+
+res_ah <- get_de("Active_vs_Healthy")
+res_ih <- get_de("Inactive_vs_Healthy")
+res_ai <- get_de("Active_vs_Inactive")
+
+n_sig <- function(r) sum(r$adj.P.Val < 0.05 & abs(r$logFC) > 1)
+
+tibble(
+  comparison  = c("Active vs Healthy", "Inactive vs Healthy", "Active vs Inactive"),
+  significant = c(n_sig(res_ah), n_sig(res_ih), n_sig(res_ai))
+)
+```
+
+The criteria for a significant gene are an adjusted p-value below 0.05 and an absolute log2 fold change above 1.
+
+## 4.2 Volcano plot
+
+```{r volcano}
+volcano_plot <- function(res, title) {
+  df <- res %>%
+    mutate(status = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Up",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Down",
+      TRUE ~ "Not significant"
+    ))
+
+  labels_df <- df %>%
+    filter(status != "Not significant") %>%
+    slice_min(adj.P.Val, n = 10)
+
+  ggplot(df, aes(logFC, -log10(P.Value), colour = status)) +
+    geom_point(alpha = 0.6, size = 1) +
+    geom_text_repel(data = labels_df, aes(label = gene),
+                    size = 3, show.legend = FALSE) +
+    scale_colour_manual(values = c(Up = "firebrick", Down = "steelblue",
+                                   "Not significant" = "grey70")) +
+    labs(title = title, x = "log2 fold change",
+         y = "-log10 p-value", colour = NULL) +
+    theme_minimal()
+}
+
+p_volcano <- volcano_plot(res_ah, "Active AOSD vs healthy controls")
+save_fig(p_volcano, "04_volcano_active_vs_healthy")
+```
+
+## 4.3 Heatmap of the top differentially expressed genes
+
+```{r de-heatmap}
+top50 <- res_ah %>% arrange(adj.P.Val) %>% slice_head(n = 50) %>% pull(gene)
+
+ph_top50 <- pheatmap(expr_gene[top50, ],
+                     annotation_col = annot_col,
+                     scale = "row",
+                     show_colnames = FALSE,
+                     fontsize_row = 7,
+                     main = "Top 50 differentially expressed genes: Active vs Healthy")
+
+save_pheat(ph_top50, "05_top50_de_heatmap", h = 7)
+```
+
+# 5. Interpretation of gene sets: GO enrichment
+
+Genes are split into those higher and lower in active AOSD, and each set is tested for over-representation of Gene Ontology biological processes using the full set of expressed genes as background.
+
+```{r go-enrichment}
+sig_up   <- res_ah %>% filter(adj.P.Val < 0.05, logFC >  1) %>% pull(gene)
+sig_down <- res_ah %>% filter(adj.P.Val < 0.05, logFC < -1) %>% pull(gene)
+cat("Up in active AOSD:", length(sig_up), "| Down in active AOSD:", length(sig_down), "\n")
+
+run_go <- function(genes) {
+  if (length(genes) < 10) return(NULL)
+  enrichGO(gene          = genes,
+           universe      = rownames(expr_gene),
+           OrgDb         = org.Hs.eg.db,
+           keyType       = "SYMBOL",
+           ont           = "BP",
+           pvalueCutoff  = 0.05,
+           pAdjustMethod = "BH")
+}
+
+go_up   <- run_go(sig_up)
+go_down <- run_go(sig_down)
+```
+
+```{r go-plots}
+if (!is.null(go_up) && nrow(as.data.frame(go_up)) > 0) {
+  p_go_up <- dotplot(go_up, showCategory = 15) +
+    ggtitle("GO biological processes: higher in active AOSD")
+  save_fig(p_go_up, "06_go_up_active", w = 8, h = 6)
+} else {
+  cat("No significant GO terms for the up-regulated genes.")
+}
+
+if (!is.null(go_down) && nrow(as.data.frame(go_down)) > 0) {
+  p_go_down <- dotplot(go_down, showCategory = 15) +
+    ggtitle("GO biological processes: lower in active AOSD")
+  save_fig(p_go_down, "07_go_down_active", w = 8, h = 6)
+} else {
+  cat("No significant GO terms for the down-regulated genes.")
+}
+```
+
+# 6. Machine learning: classification
+
+## 6.1 Task definition
+
+The classification task is active AOSD versus healthy control. The inactive group is excluded so the classes are clearly separated and the question is easy to interpret. Inactive samples could be added later as a three-class extension.
+
+```{r ml-setup}
+ml_samples <- group %in% c("Active", "Healthy")
+X <- t(expr_gene[, ml_samples])          # samples x genes
+y <- droplevels(group[ml_samples])        # Healthy and Active
+
+cat("Class sizes:\n")
+table(y)
+```
+
+## 6.2 Feature selection inside each fold
+
+Choosing genes on the full dataset and then testing on the same samples would leak information and inflate accuracy. To avoid this, the top genes are selected from the training samples only, within every fold.
+
+```{r ml-helpers}
+top_genes_by_limma <- function(X_train, y_train, n = 50) {
+  design_tr <- model.matrix(~ y_train)
+  fit_tr    <- eBayes(lmFit(t(X_train), design_tr))
+  tt        <- topTable(fit_tr, coef = 2, number = n, sort.by = "P")
+  rownames(tt)
+}
+```
+
+## 6.3 Stratified cross-validation
+
+Five folds are created with `caret::createFolds`, which keeps the class balance in each fold. Within each fold, the SVM and k-NN classifiers are trained on the selected genes and tested on the held-out samples.
+
+```{r ml-cv}
+k       <- 5
+n_genes <- 50
+folds   <- createFolds(y, k = k)
+
+cv_out         <- list()
+selected_genes <- character(0)
+
+for (i in seq_along(folds)) {
+  test_idx  <- folds[[i]]
+  train_idx <- setdiff(seq_len(nrow(X)), test_idx)
+
+  if (length(unique(y[train_idx])) < 2) {
+    stop("Fold ", i, " has only one class in its training set. ",
+         "Check the class sizes in section 7.1.")
+  }
+
+  # Feature selection on training samples only
+  genes <- top_genes_by_limma(X[train_idx, , drop = FALSE], y[train_idx], n = n_genes)
+  selected_genes <- c(selected_genes, genes)
+
+  # drop = FALSE keeps a matrix even when a fold holds a single sample
+  Xtr <- X[train_idx, genes, drop = FALSE]
+  Xte <- X[test_idx,  genes, drop = FALSE]
+
+  # Scale using training-set statistics only
+  mu <- colMeans(Xtr)
+  s  <- apply(Xtr, 2, sd)
+  s[s == 0] <- 1
+  Xtr <- scale(Xtr, center = mu, scale = s)
+  Xte <- scale(Xte, center = mu, scale = s)
+
+  # Classifiers
+  svm_fit <- svm(x = Xtr, y = y[train_idx], kernel = "linear", cost = 1)
+  knn_fit <- knn3(Xtr, y[train_idx], k = 5)
+
+  cv_out[[i]] <- tibble(
+    fold   = i,
+    sample = rownames(X)[test_idx],
+    truth  = y[test_idx],
+    SVM    = predict(svm_fit, Xte),
+    kNN    = predict(knn_fit, Xte, type = "class")
+  )
+}
+
+cv_preds <- bind_rows(cv_out)
+```
+
+## 6.4 Performance evaluation
+
+Accuracy is compared with a baseline that always predicts the majority class. Sensitivity and specificity are reported because accuracy alone can hide poor performance on the minority class.
+
+```{r ml-metrics}
+baseline <- mean(cv_preds$truth == names(which.max(table(y))))
+cat("Majority-class baseline accuracy:", round(baseline, 3), "\n")
+
+metrics <- map_dfr(c("SVM", "kNN"), function(m) {
+  cm <- confusionMatrix(cv_preds[[m]], cv_preds$truth, positive = "Active")
+  tibble(
+    model       = m,
+    accuracy    = unname(cm$overall["Accuracy"]),
+    sensitivity = unname(cm$byClass["Sensitivity"]),
+    specificity = unname(cm$byClass["Specificity"])
+  )
+})
+metrics
+```
+
+```{r confusion}
+confusionMatrix(cv_preds$SVM, cv_preds$truth, positive = "Active")
+```
+
+## 6.5 Gene signature stability
+
+A gene selected in every fold is a more trustworthy candidate than one selected only occasionally.
+
+```{r gene-stability}
+gene_freq    <- sort(table(selected_genes), decreasing = TRUE)
+stable_genes <- names(gene_freq)[gene_freq == k]
+cat("Genes selected in all", k, "folds:", length(stable_genes), "\n")
+head(gene_freq, 20)
+```
+
+## 6.6 Unsupervised check: k-means clustering
+
+As a check that does not use labels, samples from all three groups are clustered on the most variable genes. If the clusters match the groups, the disease signal is strong.
+
+```{r unsupervised}
+set.seed(2026)
+km_input <- scale(t(expr_gene[top_genes, ]))
+km <- kmeans(km_input, centers = 3, nstart = 25)
+
+table(Cluster = km$cluster, Group = group)
+```
+
+# 7. Discussion
+
+## 7.1 Main findings
+
+```{r summary-numbers}
+cat("Active vs Healthy: ", n_sig(res_ah), " significant genes\n")
+cat("SVM accuracy: ", round(metrics$accuracy[metrics$model == "SVM"], 3),
+    " vs baseline ", round(baseline, 3), "\n")
+```
+
