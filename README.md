@@ -22,7 +22,7 @@ Monocytes are immune cells that play a central role in inflammation. Their gene 
 
 The main question of this project is:
 
-> Can gene activity in monocytes separate patients with active AOSD from healthy people, and which biological processes are changed?
+Can gene activity in monocytes separate patients with active AOSD from healthy people, and which biological processes are changed?
 
 We tested two hypotheses:
 
